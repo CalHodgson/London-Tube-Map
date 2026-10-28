@@ -217,6 +217,16 @@
       return r.json();
     }
 
+    // Run fn over items, at most `limit` at a time (so we never fire a burst of requests at TfL)
+    async function mapLimit(items, limit, fn) {
+      const out = new Array(items.length);
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (next < items.length) { const i = next++; out[i] = await fn(items[i], i); }
+      }));
+      return out;
+    }
+
     // Names are cached in this browser so repeat loads need almost no TfL requests
     const NAME_CACHE_KEY = "tube-stops-v2";
     function readCache() { try { return JSON.parse(localStorage.getItem(NAME_CACHE_KEY)) || {}; } catch (e) { return {}; } }
@@ -250,22 +260,32 @@
       }
       const routeLines = new Map();   // station ID -> lines TfL says serve it
 
-      // 1. TfL route data: which lines serve each station, plus some names and positions
-      try {
-        const routes = await Promise.all(LINE_ORDER.map(async id => ({
-          id, data: await getJSON(`https://api.tfl.gov.uk/Line/${id}/Route/Sequence/all`)
-        })));
-        for (const { id, data } of routes) {
-          data.stations.forEach(st => addStop(names, coords, st));
-          for (const route of data.orderedLineRoutes) {
-            for (const sid of route.naptanIds) {
-              if (!routeLines.has(sid)) routeLines.set(sid, new Set());
-              routeLines.get(sid).add(id);
+      // 1. TfL route data: which lines serve each station. It rarely changes, so keep it for a day and skip the
+      //    11 requests on later loads.
+      const ROUTE_KEY = "tube-routes-v1", ROUTE_TTL = 24 * 3600 * 1000;
+      let cachedRoutes = null;
+      try { cachedRoutes = JSON.parse(localStorage.getItem(ROUTE_KEY)); } catch (e) { /* nothing saved */ }
+      if (cachedRoutes && cachedRoutes.lines && Date.now() - cachedRoutes.t < ROUTE_TTL) {
+        for (const [sid, ls] of Object.entries(cachedRoutes.lines)) routeLines.set(sid, new Set(ls));
+      } else {
+        try {
+          const routes = await mapLimit(LINE_ORDER, 4, async id => ({
+            id, data: await getJSON(`https://api.tfl.gov.uk/Line/${id}/Route/Sequence/all`)
+          }));
+          for (const { id, data } of routes) {
+            data.stations.forEach(st => addStop(names, coords, st));
+            for (const route of data.orderedLineRoutes) {
+              for (const sid of route.naptanIds) {
+                if (!routeLines.has(sid)) routeLines.set(sid, new Set());
+                routeLines.get(sid).add(id);
+              }
             }
           }
+          // only keep it if every line came back
+          try { localStorage.setItem(ROUTE_KEY, JSON.stringify({ t: Date.now(), lines: Object.fromEntries([...routeLines].map(([k, v]) => [k, [...v]])) })); } catch (e) { /* storage unavailable */ }
+        } catch (e) {
+          console.warn("TfL route data failed; using the track file's own line information", e);
         }
-      } catch (e) {
-        console.warn("TfL route data failed; using the track file's own line information", e);
       }
 
       // 2. Stations TfL lists that the track file does not have (e.g. new stations, or ones the file leaves out)
@@ -274,18 +294,22 @@
 
       // 3. Look up whatever is still missing: names and positions
       const missing = [...inFile, ...extra].filter(id => !names[id] || !coords[id]);
-      for (let i = 0; i < missing.length; i += 25) {
-        const chunk = missing.slice(i, i + 25);
+      let limited = false;
+      const lookup = async ids => {
+        if (limited || !ids.length) return;
         try {
-          const res = await getJSON(`https://api.tfl.gov.uk/StopPoint/${chunk.join(",")}`);
+          const res = await getJSON(`https://api.tfl.gov.uk/StopPoint/${ids.join(",")}`);
           (Array.isArray(res) ? res : [res]).forEach(s => addStop(names, coords, s));
         } catch (e) {
-          await Promise.all(chunk.map(async id => {
-            try { addStop(names, coords, await getJSON(`https://api.tfl.gov.uk/StopPoint/${id}`)); }
-            catch (e2) { /* named by code below */ }
-          }));
+          if (/^429/.test(e.message)) { limited = true; return; }      // TfL says slow down: stop asking
+          if (ids.length === 1) return;                                // this one cannot be looked up: leave it
+          const mid = ids.length >> 1;                                 // otherwise halve the batch to find the troublemaker
+          await lookup(ids.slice(0, mid));
+          await lookup(ids.slice(mid));
         }
-      }
+      };
+      for (let i = 0; i < missing.length; i += 25) await lookup(missing.slice(i, i + 25));
+      if (limited) console.warn("TfL's request limit was reached while looking up stations; the rest will be fetched next time you open the page");
       if (missing.length) {
         const toCache = { ...cache };
         for (const id of [...inFile, ...extra]) {
@@ -1273,7 +1297,7 @@
           updated = new Date(); problem = null;
         } catch (e) {
           console.warn("Arrivals request failed", e);
-          problem = e.message.slice(0, 60);
+          problem = /^429/.test(e.message) ? "TfL's request limit reached, pausing for a minute" : e.message.slice(0, 60);
           if (/^429/.test(e.message)) skip = 6;     // TfL says slow down: pause for about a minute
         }
         busy = false;
